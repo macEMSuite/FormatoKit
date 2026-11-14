@@ -109,6 +109,35 @@ public nonisolated struct FormatoArray: Sendable, Equatable {
         return out
     }
 
+    /// Every value converted to Float, in C order: what an app image holds while a computation runs (FormatoKit#115). A
+    /// float32 value is its stored bits; an integer or a float64 is rounded once to the nearest Float (exact for 8- and
+    /// 16-bit integers); for a colour type, every sample, interleaved.
+    public func floats() -> [Float] {
+        let n = count * dataType.components
+        return [Float](unsafeUninitializedCapacity: n) { out, initialized in
+            bytes.withUnsafeBytes { p in
+                func fill<T: FixedWidthInteger>(_: T.Type) {
+                    for i in 0..<n { out[i] = Float(T(littleEndian: p.loadUnaligned(fromByteOffset: i * MemoryLayout<T>.size, as: T.self))) }
+                }
+                switch dataType {
+                case .int8: fill(Int8.self)
+                case .uint8, .rgb8, .rgba8: fill(UInt8.self)
+                case .int16: fill(Int16.self)
+                case .uint16, .rgb16, .rgba16: fill(UInt16.self)
+                case .int32: fill(Int32.self)
+                case .uint32: fill(UInt32.self)
+                case .int64: fill(Int64.self)
+                case .uint64: fill(UInt64.self)
+                case .float32:
+                    for i in 0..<n { out[i] = Float(bitPattern: UInt32(littleEndian: p.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self))) }
+                case .float64:
+                    for i in 0..<n { out[i] = Float(Double(bitPattern: UInt64(littleEndian: p.loadUnaligned(fromByteOffset: 8 * i, as: UInt64.self)))) }
+                }
+            }
+            initialized = n
+        }
+    }
+
     /// The hyperslab `[start, start + count)` per dimension, cut from this array in C order: the eager reference every lazy
     /// read is compared with (`ArrayTests`).
     public func slab(start: [Int], count: [Int]) throws -> FormatoArray {

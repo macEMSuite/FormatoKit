@@ -15,6 +15,7 @@
 //  says so, and so does a Thermo/FEI file (an extended header of exactly 128 * 1024 bytes), whose pixel size sits in
 //  that header. DIFFERENCES from `MRCReader`: signed mode 0, the stamp honoured, Angstrom not nm, stacks and
 //  modes 4 / 12 refused or converted, Float32 pixels, no squeeze, no FEI pixel size, no origin.
+//  `readStored` gives the same reading with the pixels in the mode's stored type (`FormatoArray`; FormatoKit#115).
 //
 
 import Foundation
@@ -62,6 +63,115 @@ public nonisolated enum MRCAppImage {
     }
 
     public static func read(data: Data, fileName: String, acceptStacks: Bool = false) throws -> Image {
+        let header = try decodeHeader(data: data, fileName: fileName, acceptStacks: acceptStacks)
+        let (count, mode, bigEndian) = (header.width * header.height, header.mode, header.bigEndian)
+        var pixels = [Float](repeating: 0, count: count)
+        header.pixelBytes.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            func u16(_ i: Int) -> UInt16 {
+                let v = buffer.loadUnaligned(fromByteOffset: 2 * i, as: UInt16.self)
+                return bigEndian ? UInt16(bigEndian: v) : UInt16(littleEndian: v)
+            }
+            for i in 0..<count {
+                switch mode {
+                case 0: pixels[i] = Float(Int8(bitPattern: buffer[i]))
+                case 1: pixels[i] = Float(Int16(bitPattern: u16(i)))
+                case 6: pixels[i] = Float(u16(i))
+                case 12: pixels[i] = halfToFloat(u16(i))
+                default:
+                    let v = buffer.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self)
+                    pixels[i] = Float(bitPattern: bigEndian ? UInt32(bigEndian: v) : UInt32(littleEndian: v))
+                }
+            }
+        }
+
+        return Image(width: header.width, height: header.height, pixels: pixels, x: header.x, y: header.y, fileName: fileName,
+                     source: header.source, notes: header.notes)
+    }
+
+    // MARK: - Reading at the stored bit depth (FormatoKit#115)
+
+    /// One image at the file's stored element type, with the calibration and notes `read` gives (same refusals, axes,
+    /// source and notes as `Image`; only the pixels differ in type).
+    public struct StoredImage: Sendable, Equatable {
+        public let width: Int
+        public let height: Int
+        /// Shape `[height, width]` (row-major, `width` fastest) in the mode's type: int8 (mode 0), int16 (1), float32 (2),
+        /// uint16 (6). Mode 12 (float16) has no stored type here and is widened exactly to float32. Converting each value
+        /// to Float gives `Image.pixels`.
+        public let pixels: FormatoArray
+        public let x: Axis?
+        public let y: Axis?
+        public let fileName: String
+        public let source: String
+        public let notes: [String]
+    }
+
+    /// `read(path:)` at the stored bit depth: no Float32 array is made on the way (except for mode 12, see `StoredImage`).
+    public static func readStored(path: String, acceptStacks: Bool = false) throws -> StoredImage {
+        let data: Data
+        do { data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) } catch {
+            throw FormatoReadError.cannotOpen(formatoDisplayFileName(path), error.localizedDescription)
+        }
+        return try readStored(data: data, fileName: formatoDisplayFileName(path), acceptStacks: acceptStacks)
+    }
+
+    /// The samples copied once from the file, swapped to little-endian where the stamp says big-endian.
+    public static func readStored(data: Data, fileName: String, acceptStacks: Bool = false) throws -> StoredImage {
+        let header = try decodeHeader(data: data, fileName: fileName, acceptStacks: acceptStacks)
+        let count = header.width * header.height
+        let type: FormatoDataType
+        var bytes: Data
+        switch header.mode {
+        case 0: type = .int8
+        case 1: type = .int16
+        case 6: type = .uint16
+        case 2: type = .float32
+        default: type = .float32      // mode 12, float16
+        }
+        if header.mode == 12 {
+            bytes = Data(count: 4 * count)
+            header.pixelBytes.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+                bytes.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
+                    for i in 0..<count {
+                        let v = src.loadUnaligned(fromByteOffset: 2 * i, as: UInt16.self)
+                        let half = header.bigEndian ? UInt16(bigEndian: v) : UInt16(littleEndian: v)
+                        dst.storeBytes(of: halfToFloat(half).bitPattern.littleEndian, toByteOffset: 4 * i, as: UInt32.self)
+                    }
+                }
+            }
+        } else {
+            bytes = Data(header.pixelBytes)
+            let size = type.byteSize
+            if header.bigEndian && size > 1 {
+                bytes.withUnsafeMutableBytes { (p: UnsafeMutableRawBufferPointer) in
+                    for i in 0..<count {
+                        for j in 0..<(size / 2) {
+                            let a = i * size + j, b = i * size + size - 1 - j
+                            let t = p[a]; p[a] = p[b]; p[b] = t
+                        }
+                    }
+                }
+            }
+        }
+        return StoredImage(width: header.width, height: header.height,
+                           pixels: try FormatoArray(dataType: type, shape: [header.height, header.width], bytes: bytes),
+                           x: header.x, y: header.y, fileName: fileName, source: header.source, notes: header.notes)
+    }
+
+    /// The header's reading: everything `read` hands back but the pixels, and the pixels' bytes in the file.
+    private struct Header {
+        let width: Int
+        let height: Int
+        let mode: Int
+        let bigEndian: Bool
+        let pixelBytes: Data
+        let x: Axis?
+        let y: Axis?
+        let source: String
+        let notes: [String]
+    }
+
+    private static func decodeHeader(data: Data, fileName: String, acceptStacks: Bool) throws -> Header {
         guard data.count >= 1024 else { throw MRCError.notMRC("\(data.count) bytes, shorter than an MRC header") }
         let bytes = [UInt8](data.prefix(1024))
         guard bytes[208..<212].elementsEqual(Array("MAP ".utf8)) else { throw MRCError.notMRC("no \"MAP \" id") }
@@ -102,26 +212,6 @@ public nonisolated enum MRCAppImage {
             throw MRCError.truncated
         }
         let start = data.startIndex + 1024 + extended
-
-        var pixels = [Float](repeating: 0, count: count)
-        data[start ..< start + needed].withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-            func u16(_ i: Int) -> UInt16 {
-                let v = buffer.loadUnaligned(fromByteOffset: 2 * i, as: UInt16.self)
-                return bigEndian ? UInt16(bigEndian: v) : UInt16(littleEndian: v)
-            }
-            for i in 0..<count {
-                switch mode {
-                case 0: pixels[i] = Float(Int8(bitPattern: buffer[i]))
-                case 1: pixels[i] = Float(Int16(bitPattern: u16(i)))
-                case 6: pixels[i] = Float(u16(i))
-                case 12: pixels[i] = halfToFloat(u16(i))
-                default:
-                    let v = buffer.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self)
-                    pixels[i] = Float(bitPattern: bigEndian ? UInt32(bigEndian: v) : UInt32(littleEndian: v))
-                }
-            }
-        }
-
         // mrcfile's voxel_size: float32 cella over the integer sampling, computed in float64, stored as float32.
         let mx = int(7), my = int(8)
         let xScale = Double(Float(Double(float(10)) / Double(mx)))
@@ -137,8 +227,8 @@ public nonisolated enum MRCAppImage {
         }
         let kind = ["int8", "int16", "float32", "", "", "", "uint16"].indices.contains(mode)
             ? ["int8", "int16", "float32", "", "", "", "uint16"][mode] : "float16"
-        return Image(width: nx, height: ny, pixels: pixels, x: x, y: y, fileName: fileName,
-                     source: (["MRC · mode \(mode) \(kind)"] + notes).joined(separator: " · "), notes: notes)
+        return Header(width: nx, height: ny, mode: mode, bigEndian: bigEndian, pixelBytes: data[start ..< start + needed], x: x, y: y,
+                      source: (["MRC · mode \(mode) \(kind)"] + notes).joined(separator: " · "), notes: notes)
     }
 }
 

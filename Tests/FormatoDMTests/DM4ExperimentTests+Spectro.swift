@@ -2,6 +2,7 @@
 // the rest stay in DM4ExperimentTests.swift. Helpers are duplicated, not shared, across the split.
 import Testing
 import Foundation
+import FormatoCore
 import FormatoDM
 
 /// `DM4Experiment` lists every image object of a GMS `.dm4`
@@ -556,5 +557,39 @@ import FormatoDM
         #expect(throws: (any Error).self) { try listing([.rawInfo("B", [15, 0, 1_000_000])]).get() }
         #expect(throws: (any Error).self) { try listing([.rawInfo("C", [20, 15, 0, 1, 0, 3, UInt64(Int.max)])]).get() }
         #expect(throws: (any Error).self) { try listing([.rawInfo("D", [18, UInt64.max])]).get() }
+    }
+
+    // MARK: The stored bit depth (FormatoKit#115)
+
+    /// An 8-bit, a 16-bit and a float32 image read at their stored type: every value equals the stored one, bit for bit, and
+    /// widened to Float it is `readImage`'s pixel. Red before: `readStoredImage` did not exist.
+    @Test func testAnImageReadsAtItsStoredBitDepth() throws {
+        let u8: [UInt8] = [0, 1, 127, 128, 254, 255]
+        let u16: [UInt16] = [0, 1, 255, 256, 65534, 65535]
+        let i16: [Int16] = [-32768, -1, 0, 1, 300, 32767]
+        let f32: [Float] = [-0.5, 0, Float.leastNormalMagnitude / 4, 3.25, .infinity, 1e30]
+        let data = Self.file(imageList: [
+            Self.object(name: "U8", dataType: 6, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 10, blob: u8, count: 6, tags: []),
+            Self.object(name: "U16", dataType: 10, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 4, blob: Self.u16s(u16), count: 6, tags: []),
+            Self.object(name: "I16", dataType: 1, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 2, blob: Self.i16s(i16), count: 6, tags: []),
+            Self.object(name: "F32", dataType: 2, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 6, blob: Self.f32s(f32), count: 6, tags: []),
+        ])
+        let expected: [(FormatoDataType, [UInt8])] = [(.uint8, u8), (.uint16, Self.u16s(u16)), (.int16, Self.i16s(i16)), (.float32, Self.f32s(f32))]
+        for (index, (type, bytes)) in expected.enumerated() {
+            let stored = try DM4Experiment.readStoredImage(data: data, index: index + 1)
+            let float = try DM4Experiment.readImage(data: data, index: index + 1)
+            #expect(stored.pixels.dataType == type, "object \(index + 1)")
+            #expect(stored.pixels.shape == [2, 3])
+            #expect(Array(stored.pixels.bytes) == bytes, "object \(index + 1): the stored bytes, nothing converted")
+            #expect(stored.pixels.floats().map(\.bitPattern) == float.pixels.map(\.bitPattern))
+            #expect(stored.width == float.width && stored.height == float.height)
+            #expect(stored.xAxis == float.xAxis && stored.yAxis == float.yAxis && stored.object == float.object)
+        }
+        #expect(try DM4Experiment.readStoredImage(data: data, index: 2).pixels.doubles() == u16.map(Double.init))
+        // The same refusals: a 3D object and a missing index.
+        let cube = Self.file(imageList: [Self.object(name: "Cube", dataType: 2, dims: [2, 3, 4], axes: [Self.um, Self.um, Self.nm],
+                                                     blobType: 6, blob: Self.f32s((0..<24).map { Float($0) }), count: 24, tags: [])])
+        #expect(throws: DM4Error.self) { try DM4Experiment.readStoredImage(data: cube, index: 1) }
+        #expect(throws: DM4Error.self) { try DM4Experiment.readStoredImage(data: data, index: 9) }
     }
 }
