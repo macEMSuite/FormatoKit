@@ -177,8 +177,8 @@ public nonisolated enum TIFFAppImage {
                 }
             }
         } else {
-            // The strips may hold more than the image: only the image's bytes are kept.
-            bytes = page.raw.count == count * size ? page.raw : page.raw.prefix(count * size)
+            // `decodePage` keeps only the image's bytes.
+            bytes = page.raw
             if page.samplesBigEndian && size > 1 {
                 bytes.withUnsafeMutableBytes { (p: UnsafeMutableRawBufferPointer) in
                     for i in 0..<count {
@@ -216,7 +216,7 @@ public nonisolated enum TIFFAppImage {
         let bytesPerSample: Int
         let format: Int
         let isRGB: Bool
-        /// The samples (three per pixel for RGB) in strip order; at least the image's bytes, perhaps more.
+        /// The samples (three per pixel for RGB) in strip order: exactly the image's bytes.
         let raw: Data
         /// True when `raw` holds big-endian samples (an uncompressed MM file; a decompressed page is little-endian).
         let samplesBigEndian: Bool
@@ -289,21 +289,27 @@ public nonisolated enum TIFFAppImage {
             guard !overflow else { throw Refusal.truncated }
             needed = product
         }
+        // Strips that together hold more than the file point at the same bytes: a corrupt header, refused before copying.
         var stripped = 0
         for (offset, count) in zip(offsets, counts) {
-            guard offset >= 0, count >= 0, count <= data.count, offset <= data.count - count else { throw Refusal.truncated }
+            guard offset >= 0, count >= 0, count <= data.count, offset <= data.count - count, count <= data.count - stripped else {
+                throw Refusal.truncated
+            }
             stripped += count
         }
         var raw: Data
         if compression == 1 {
             guard stripped >= needed else { throw Refusal.truncated }
-            raw = Data(capacity: stripped)
-            for (offset, count) in zip(offsets, counts) {
-                raw.append(data[data.startIndex + offset ..< data.startIndex + offset + count])
+            // Only the image's bytes are copied, not what the strips hold beyond them.
+            raw = Data(capacity: needed)
+            for (offset, count) in zip(offsets, counts) where raw.count < needed {
+                let take = min(count, needed - raw.count)
+                raw.append(data[data.startIndex + offset ..< data.startIndex + offset + take])
             }
         } else {
-            // LZW gives at most 4096 bytes per 12-bit code: a larger claim is a corrupt header, refused before allocating.
-            guard needed / 2731 <= data.count else { throw Refusal.truncated }
+            // LZW gives at most 4096 bytes per 12-bit code: a claim larger than the strips can give is a corrupt header,
+            // refused before allocating.
+            guard needed / 2731 <= stripped else { throw Refusal.truncated }
             let rowsPerStrip = max(1, min(tags.integer(byCode[278]) ?? height, height))
             do {
                 raw = try TIFFCompression.decodePage(

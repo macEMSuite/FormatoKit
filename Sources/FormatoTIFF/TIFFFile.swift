@@ -123,16 +123,22 @@ public nonisolated struct TIFFFile: Sendable {
         }
         var dirs: [TIFFDirectory] = []
         var seen = Set<Int>()
+        // Every tag value is copied and decoded: together they may hold what the file holds (and a little more, for values
+        // a few pages share), never a multiple of it from tags that point at the same bytes.
+        var budget = data.count + TIFFFile.tagValueSlack
         while first != 0 {
             guard seen.insert(first).inserted else { throw TIFFError.loop(name) }
-            let (dir, next) = try TIFFFile.readDirectory(at: first, reader: reader, bigTIFF: bigTIFF, name: name)
+            let (dir, next) = try TIFFFile.readDirectory(at: first, reader: reader, bigTIFF: bigTIFF, name: name, budget: &budget)
             dirs.append(dir)
             first = next
         }
         directories = dirs
     }
 
-    private static func readDirectory(at offset: Int, reader: ByteReader, bigTIFF: Bool, name: String) throws
+    /// What the tag values of a file may hold beyond the file's own size.
+    static let tagValueSlack = 1 << 20
+
+    private static func readDirectory(at offset: Int, reader: ByteReader, bigTIFF: Bool, name: String, budget: inout Int) throws
         -> (TIFFDirectory, Int) {
         let count = bigTIFF ? try reader.int64(offset, name) : Int(try reader.u16(offset, name))
         let entrySize = bigTIFF ? 20 : 12
@@ -148,7 +154,8 @@ public nonisolated struct TIFFFile: Sendable {
             let inline = bigTIFF ? 8 : 4
             let size = typeSizes[type] ?? 1
             let (bytes, overflow) = n.multipliedReportingOverflow(by: size)
-            guard !overflow, n >= 0 else { throw TIFFError.truncated(name) }
+            guard !overflow, n >= 0, bytes <= budget else { throw TIFFError.truncated(name) }
+            budget -= bytes
             let valueOffset = bytes <= inline ? fieldOffset
                 : (bigTIFF ? try reader.int64(fieldOffset, name) : Int(try reader.u32(fieldOffset, name)))
             let raw = try reader.slice(valueOffset, bytes, name)

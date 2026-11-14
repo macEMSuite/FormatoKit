@@ -33,14 +33,21 @@ nonisolated enum TIFFCompression {
     }
 
     /// The page's pixels as little-endian bytes, `rows` rows of `rowBytes`: each strip decoded and cut to its rows, the
-    /// predictor undone. `strip(i)` returns strip `i`'s stored bytes.
+    /// predictor undone. `strip(i)` returns strip `i`'s stored bytes. With `only`, just the strips that hold those rows are
+    /// read and decoded, and the bytes start at the first row of the first of them (`only.lowerBound` rounded down to a
+    /// strip).
     static func decodePage(compression: Int, predictor: Int, rows: Int, rowsPerStrip: Int, width: Int, samples: Int,
-                           bytesPerSample: Int, bigEndian: Bool, strips: Int, strip: (Int) throws -> Data) throws -> Data {
+                           bytesPerSample: Int, bigEndian: Bool, strips: Int, only: Range<Int>? = nil,
+                           strip: (Int) throws -> Data) throws -> Data {
         let rowBytes = width * samples * bytesPerSample
         let stripCount = (rows + rowsPerStrip - 1) / rowsPerStrip
         guard strips >= stripCount else { throw Failure(reason: "it has fewer strips than its rows need") }
-        var page = Data(capacity: rows * rowBytes)
-        for s in 0..<stripCount {
+        let wanted = only.map { $0.clamped(to: 0..<rows) } ?? 0..<rows
+        guard !wanted.isEmpty else { return Data() }
+        let stripRange = (wanted.lowerBound / rowsPerStrip) ..< ((wanted.upperBound - 1) / rowsPerStrip + 1)
+        let firstRow = stripRange.lowerBound * rowsPerStrip
+        var page = Data(capacity: (min(rows, stripRange.upperBound * rowsPerStrip) - firstRow) * rowBytes)
+        for s in stripRange {
             let stripRows = min(rowsPerStrip, rows - s * rowsPerStrip)
             let need = stripRows * rowBytes
             let stored = try strip(s)

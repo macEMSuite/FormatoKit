@@ -148,11 +148,14 @@ public nonisolated struct TIFFPageLayout: Sendable, Equatable {
 
     /// A compressed page's pixels as little-endian bytes, row after row: its strips read from `fd`, decoded, the predictor
     /// undone (TIFFCompression).
-    func decodedPage(fd: Int32, path: String) throws -> Data {
+    /// With `rows`, only the strips that hold them are read and decoded; the bytes then start at the first row of the
+    /// first of those strips, `rows.lowerBound / rowsPerStrip * rowsPerStrip`.
+    func decodedPage(fd: Int32, path: String, rows: Range<Int>? = nil) throws -> Data {
         do {
             return try TIFFCompression.decodePage(
                 compression: compression, predictor: predictor, rows: height, rowsPerStrip: rowsPerStrip, width: width,
-                samples: samples, bytesPerSample: bytesPerSample, bigEndian: bigEndian, strips: stripOffsets.count) { s in
+                samples: samples, bytesPerSample: bytesPerSample, bigEndian: bigEndian, strips: stripOffsets.count,
+                only: rows) { s in
                     let count = stripByteCounts[s]
                     var strip = Data(count: count)
                     let got = count == 0 ? 0 : strip.withUnsafeMutableBytes { pread(fd, $0.baseAddress!, count, off_t(stripOffsets[s])) }
@@ -812,10 +815,12 @@ public nonisolated struct TIFFSeriesArray: FormatoLazyArray {
             let src = series.source(image)
             if src.layout.isCompressed {
                 guard nx > 0, ny > 0 else { continue }
-                let page = try src.layout.decodedPage(fd: fd, path: path)
+                // Only the strips that hold the slab's rows are decoded, not the whole page.
+                let page = try src.layout.decodedPage(fd: fd, path: path, rows: y0 ..< (y0 + ny))
                 let rowBytes = src.layout.rowBytes
+                let firstRow = y0 / src.layout.rowsPerStrip * src.layout.rowsPerStrip
                 for y in y0..<(y0 + ny) {
-                    let at = y * rowBytes + x0 * el
+                    let at = (y - firstRow) * rowBytes + x0 * el
                     out.append(page.subdata(in: at ..< at + nx * el))
                 }
                 continue
