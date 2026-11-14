@@ -733,7 +733,10 @@ private nonisolated struct EMDReader {
             let status = withUnsafeMutableBytes(of: &pointer) { read($0.baseAddress) }
             guard status >= 0, let pointer else { throw bad("reading \(key)") }
             defer { _ = h5.h5freeMemory(pointer) }
-            return String(cString: pointer)
+            guard let text = boundedCString(pointer, maximumBytes: HDF5Reader.defaultMaximumStringBytes) else {
+                throw bad("\(key) is longer than \(HDF5Reader.defaultMaximumStringBytes) bytes")
+            }
+            return text
         }
         let n = h5.h5tgetSize(type)
         guard n > 0, n < 65536 else { throw bad("invalid string size for \(key)") }
