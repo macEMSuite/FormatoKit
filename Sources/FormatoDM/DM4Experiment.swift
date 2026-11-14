@@ -307,13 +307,24 @@ public nonisolated enum DM4Experiment {
         return source.counter.bytes
     }
 
+    /// `readImage(data:index:)` with a smaller memory limit and conversion block, for tests of the bounds.
+    package static func readImage(data: Data, index: Int, maxBytes: Int, blockBytes: Int) throws -> DM4Image {
+        try decode2D(try imageObject(index, source: Source.data(data)), source: Source.data(data), maxBytes: maxBytes,
+                     blockBytes: blockBytes)
+    }
+
+    /// `readStoredImage(data:index:)` with a smaller memory limit, for tests of the bounds.
+    package static func readStoredImage(data: Data, index: Int, maxBytes: Int) throws -> DM4StoredImage {
+        try readStoredImage(source: Source.data(data), index: index, maxBytes: maxBytes)
+    }
+
     private static func readImage(source: Source, index: Int) throws -> DM4Image {
         try decode2D(try imageObject(index, source: source), source: source)
     }
 
-    private static func readStoredImage(source: Source, index: Int) throws -> DM4StoredImage {
+    private static func readStoredImage(source: Source, index: Int, maxBytes: Int = maxImageBytes) throws -> DM4StoredImage {
         let object = try imageObject(index, source: source)
-        let blob = try fetch2D(object, source: source)
+        let blob = try fetch2D(object, source: source, maxBytes: maxBytes)
         let type: FormatoDataType
         switch object.dataType {
         case 1: type = .int16
@@ -328,7 +339,7 @@ public nonisolated enum DM4Experiment {
         }
         // DM stores little-endian, FormatoArray's order: the fetched bytes are the array.
         return DM4StoredImage(object: object, width: blob.width, height: blob.height,
-                              pixels: try FormatoArray(dataType: type, shape: [blob.height, blob.width], bytes: Data(blob.raw)),
+                              pixels: try FormatoArray(dataType: type, shape: [blob.height, blob.width], bytes: blob.raw),
                               xAxis: blob.xAxis, yAxis: blob.yAxis)
     }
 
@@ -411,11 +422,13 @@ public nonisolated enum DM4Experiment {
     // MARK: Byte source
 
     /// Where bytes come from: a file read through `FileHandle` (seek + bounded reads, on any
-    /// volume), or a `Data` for tests. `fetch` returns exactly `count` bytes or throws.
+    /// volume), or a `Data` for tests. `fetchData` returns exactly `count` bytes or throws; `fetch` gives them as an array.
     private struct Source {
         let size: Int
-        let fetch: (_ offset: Int, _ count: Int) throws -> [UInt8]
+        let fetchData: (_ offset: Int, _ count: Int) throws -> Data
         let counter: Counter
+
+        func fetch(_ offset: Int, _ count: Int) throws -> [UInt8] { [UInt8](try fetchData(offset, count)) }
 
         final class Counter: @unchecked Sendable { var bytes = 0 }
 
@@ -433,13 +446,13 @@ public nonisolated enum DM4Experiment {
             }
             let counter = Counter()
             let name = formatoDisplayFileName(path)
-            return Source(size: size, fetch: { offset, count in
+            return Source(size: size, fetchData: { offset, count in
                 do {
                     try handle.seek(toOffset: UInt64(offset))
                     let got = try handle.read(upToCount: count) ?? Data()
                     guard got.count == count else { throw DM4Error.truncated }
                     counter.bytes += count
-                    return [UInt8](got)
+                    return got
                 } catch let error as DM4Error {
                     throw error
                 } catch {
@@ -450,42 +463,68 @@ public nonisolated enum DM4Experiment {
 
         static func data(_ data: Data) -> Source {
             let counter = Counter()
-            return Source(size: data.count, fetch: { offset, count in
+            return Source(size: data.count, fetchData: { offset, count in
                 guard offset >= 0, count >= 0, count <= data.count - offset else { throw DM4Error.truncated }
                 counter.bytes += count
-                return [UInt8](data[(data.startIndex + offset)..<(data.startIndex + offset + count)])
+                return Data(data[(data.startIndex + offset)..<(data.startIndex + offset + count)])
             }, counter: counter)
         }
     }
 
     // MARK: Decode one 2D image
 
+    /// Most bytes one 2D image may take in memory, as stored or as Float32.
     private static let maxImageBytes = 1 << 30
+    /// The stored bytes `decode2D` reads and converts at a time: the Float32 image is the only full-size array it holds.
+    private static let decodeBlockBytes = 1 << 24
 
-    private static func decode2D(_ object: DM4ImageObject, source: Source) throws -> DM4Image {
-        let blob = try fetch2D(object, source: source)
-        let (raw, count) = (blob.raw, blob.width * blob.height)
+    private static func decode2D(_ object: DM4ImageObject, source: Source, maxBytes: Int = maxImageBytes,
+                                 blockBytes: Int = decodeBlockBytes) throws -> DM4Image {
+        let plan = try plan2D(object, source: source, maxBytes: maxBytes)
+        let count = plan.width * plan.height
+        guard count <= maxBytes / MemoryLayout<Float>.size else {
+            throw DM4Error.cannotOpen("Image object \(object.index) is \(count) pixels, \(count * MemoryLayout<Float>.size) bytes "
+                + "as Float32; refusing to read a 2D image that large.")
+        }
+        let size = plan.elementBytes, perBlock = max(1, blockBytes / plan.elementBytes)
         var out = [Float](repeating: 0, count: count)
-        raw.withUnsafeBytes { p in
-            switch object.dataType {
-            case 1:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) }
-            case 10: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self)) }
-            case 7:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self)) }
-            case 11: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)) }
-            case 6:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: UInt8.self)) }
-            case 9:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: Int8.self)) }
-            case 2:  for i in 0..<count { out[i] = p.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
-            case 12: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 8, as: Double.self)) }
-            default: break
+        try out.withUnsafeMutableBufferPointer { dst in
+            var i0 = 0
+            while i0 < count {
+                let n = min(perBlock, count - i0)
+                let raw = try source.fetchData(object.dataOffset + i0 * size, n * size)
+                raw.withUnsafeBytes { p in
+                    let o = dst.baseAddress! + i0
+                    switch object.dataType {
+                    case 1:  for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) }
+                    case 10: for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self)) }
+                    case 7:  for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self)) }
+                    case 11: for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)) }
+                    case 6:  for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i, as: UInt8.self)) }
+                    case 9:  for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i, as: Int8.self)) }
+                    case 2:  for i in 0..<n { o[i] = p.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
+                    case 12: for i in 0..<n { o[i] = Float(p.loadUnaligned(fromByteOffset: i * 8, as: Double.self)) }
+                    default: break
+                    }
+                }
+                i0 += n
             }
         }
-        return DM4Image(object: object, width: blob.width, height: blob.height, pixels: out,
-                        xAxis: blob.xAxis, yAxis: blob.yAxis)
+        return DM4Image(object: object, width: plan.width, height: plan.height, pixels: out,
+                        xAxis: plan.xAxis, yAxis: plan.yAxis)
     }
 
     /// One 2D object's checks and its own bytes as stored, with its size and axes.
-    private static func fetch2D(_ object: DM4ImageObject, source: Source) throws
-        -> (raw: [UInt8], width: Int, height: Int, xAxis: DM4Axis?, yAxis: DM4Axis?) {
+    private static func fetch2D(_ object: DM4ImageObject, source: Source, maxBytes: Int = maxImageBytes) throws
+        -> (raw: Data, width: Int, height: Int, xAxis: DM4Axis?, yAxis: DM4Axis?) {
+        let plan = try plan2D(object, source: source, maxBytes: maxBytes)
+        let raw = try source.fetchData(object.dataOffset, plan.width * plan.height * plan.elementBytes)  // this object's own bytes only
+        return (raw, plan.width, plan.height, plan.xAxis, plan.yAxis)
+    }
+
+    /// One 2D object's checks, its size, its element size and its axes; nothing is read.
+    private static func plan2D(_ object: DM4ImageObject, source: Source, maxBytes: Int) throws
+        -> (width: Int, height: Int, elementBytes: Int, xAxis: DM4Axis?, yAxis: DM4Axis?) {
         let big = object.dimensions.filter { $0 > 1 }
         // Singleton dimensions are dropped, so a [w, h, 1] stack reads as 2D.
         guard big.count <= 2, object.dimensions.count >= 2 else {
@@ -506,14 +545,13 @@ public nonisolated enum DM4Experiment {
               object.dataByteCount == bytes else {
             throw DM4Error.truncated
         }
-        guard bytes <= maxImageBytes else {
+        guard bytes <= maxBytes else {
             throw DM4Error.cannotOpen("Image object \(object.index) is \(bytes) bytes; refusing to read a 2D image that large.")
         }
-        let raw = try source.fetch(object.dataOffset, bytes)       // this object's own bytes only
         let axisIndices = nonSingleton.map(\.offset)
         let xAxis = axisIndices.first.flatMap { object.axes[$0] }
         let yAxis = axisIndices.count > 1 ? object.axes[axisIndices[1]] : nil
-        return (raw, width, height, xAxis, yAxis)
+        return (width, height, size, xAxis, yAxis)
     }
 
     /// Most values one EDS spectrum image may hold: a quarter of physical memory as UInt32 (this Mac panicked once reading a
