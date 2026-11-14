@@ -79,7 +79,8 @@ import FormatoCore
         let nan = Float(bitPattern: 0x7FC0_1234)
         #expect(try array(.float32, [Float(-0.0), 1e-40, nan]).floats().map(\.bitPattern) == [Float(-0.0), 1e-40, nan].map(\.bitPattern))
         #expect(try array(.float64, [0.1, 1e300]).floats() == [Float(0.1 as Double), Float(1e300 as Double)])
-        #expect(try array(.rgb8, [UInt8(1), 2, 3, 4, 5, 6]).floats() == [1, 2, 3, 4, 5, 6])
+        let rgb = try FormatoArray(dataType: .rgb8, shape: [2], bytes: Data([1, 2, 3, 4, 5, 6]))
+        #expect(rgb.floats() == [1, 2, 3, 4, 5, 6])
     }
 
     @Test func testByteCountAndShapeAreChecked() {
