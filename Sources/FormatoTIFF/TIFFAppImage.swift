@@ -20,7 +20,10 @@
 //  any other ImageJ unit, "nm" included, is uncalibrated unless Digital Micrograph tags named one; a file with a `unit=` line
 //  and no resolution tags opens uncalibrated).
 //
-//  DIFFERENCES from `TIFFSignals`: Float32 pixels (not the stored type); RGB only as an exact grey render; a stack or a
+//  STORED BIT DEPTH: `readStored` gives the same reading with the pixels in the stored element type (`FormatoArray`), no Float32
+//  copy on the way (FormatoKit#115).
+//
+//  DIFFERENCES from `TIFFSignals`: Float32 pixels from `read` (not the stored type); RGB only as an exact grey render; a stack or a
 //  second page refused (TIFFSignals reads series); BigTIFF refused; a vendor branch (Zeiss, TVIPS, ...) is not refused by
 //  name; WhiteIsZero and palette refused (TIFFSignals reads the stored values); FEI SEM: PixelWidth is the x scale (tifffile
 //  puts the width's scale on the height axis, so the two agree only on square pixels); a DM scale of 0 is no axis (not a
@@ -104,6 +107,126 @@ public nonisolated enum TIFFAppImage {
     /// `acceptUnequalChannels` exists for one caller: the negative control that must show the unequal-channel refusal is
     /// live. It reads the red channel instead of refusing.
     public static func read(data: Data, fileName: String, acceptUnequalChannels: Bool = false) throws -> Image {
+        let page = try decodePage(data: data, fileName: fileName)
+        let (width, height, bytesPerSample) = (page.width, page.height, page.bytesPerSample)
+        let decode = try decoder(bits: page.bitsPerSample, format: page.format, bigEndian: page.samplesBigEndian)
+        var pixels = [Float](repeating: 0, count: width * height)
+        try page.raw.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            if page.isRGB {
+                for i in 0..<(width * height) {
+                    let base = i * 3 * bytesPerSample
+                    let r = decode(buffer, base), g = decode(buffer, base + bytesPerSample),
+                        b = decode(buffer, base + 2 * bytesPerSample)
+                    guard acceptUnequalChannels || r == g && g == b else {
+                        throw Refusal.unequalChannels(row: i / width, column: i % width)
+                    }
+                    pixels[i] = r
+                }
+            } else {
+                for i in 0..<(width * height) { pixels[i] = decode(buffer, i * bytesPerSample) }
+            }
+        }
+        return Image(width: width, height: height, pixels: pixels, x: page.x, y: page.y, fileName: fileName,
+                     source: page.source, notes: page.notes)
+    }
+
+    // MARK: - Reading at the stored bit depth (FormatoKit#115)
+
+    /// One 2D image at the file's stored element type, with the calibration and notes `read` gives. Same file, same
+    /// refusals, same axes, source and notes as `Image`; only the pixels differ in type.
+    public struct StoredImage: Sendable, Equatable {
+        public let width: Int
+        public let height: Int
+        /// Shape `[height, width]` (row-major, `width` fastest), the element type the file stores: uint8/16/32, int8/16/32,
+        /// float32, float64. An RGB grey render is its one grey channel as uint8. Converting each value to Float gives `Image.pixels`.
+        public let pixels: FormatoArray
+        public let x: Axis?
+        public let y: Axis?
+        public let fileName: String
+        public let source: String
+        public let notes: [String]
+    }
+
+    /// `read(path:)` at the stored bit depth: no Float32 array is made on the way.
+    public static func readStored(path: String) throws -> StoredImage {
+        let data: Data
+        do { data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) } catch {
+            throw FormatoReadError.cannotOpen(formatoDisplayFileName(path), error.localizedDescription)
+        }
+        return try readStored(data: data, fileName: formatoDisplayFileName(path))
+    }
+
+    /// `read(data:fileName:)` at the stored bit depth: the samples, swapped to little-endian where the file is big-endian,
+    /// in one array the size of the stored image.
+    public static func readStored(data: Data, fileName: String) throws -> StoredImage {
+        let page = try decodePage(data: data, fileName: fileName)
+        let (width, height, size) = (page.width, page.height, page.bytesPerSample)
+        let count = width * height
+        let type = try storedType(bits: page.bitsPerSample, format: page.format)
+        var bytes: Data
+        if page.isRGB {
+            // 8-bit only (checked in decodePage): the grey channel, with the same equal-channel refusal as `read`.
+            bytes = Data(count: count)
+            try page.raw.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+                try bytes.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
+                    for i in 0..<count {
+                        let r = src[3 * i], g = src[3 * i + 1], b = src[3 * i + 2]
+                        guard r == g && g == b else { throw Refusal.unequalChannels(row: i / width, column: i % width) }
+                        dst[i] = r
+                    }
+                }
+            }
+        } else {
+            // The strips may hold more than the image: only the image's bytes are kept.
+            bytes = page.raw.count == count * size ? page.raw : page.raw.prefix(count * size)
+            if page.samplesBigEndian && size > 1 {
+                bytes.withUnsafeMutableBytes { (p: UnsafeMutableRawBufferPointer) in
+                    for i in 0..<count {
+                        for j in 0..<(size / 2) {
+                            let a = i * size + j, b = i * size + size - 1 - j
+                            let t = p[a]; p[a] = p[b]; p[b] = t
+                        }
+                    }
+                }
+            }
+        }
+        return StoredImage(width: width, height: height, pixels: try FormatoArray(dataType: type, shape: [height, width], bytes: bytes),
+                           x: page.x, y: page.y, fileName: fileName, source: page.source, notes: page.notes)
+    }
+
+    private static func storedType(bits: Int, format: Int) throws -> FormatoDataType {
+        switch (format, bits) {
+        case (1, 8): .uint8
+        case (1, 16): .uint16
+        case (1, 32): .uint32
+        case (2, 8): .int8
+        case (2, 16): .int16
+        case (2, 32): .int32
+        case (3, 32): .float32
+        case (3, 64): .float64
+        default: throw Refusal.sampleFormat("\(bits)-bit samples of format \(format)")
+        }
+    }
+
+    /// The first directory's samples as the file holds them, and everything else `read` hands back.
+    private struct Page {
+        let width: Int
+        let height: Int
+        let bitsPerSample: Int
+        let bytesPerSample: Int
+        let format: Int
+        let isRGB: Bool
+        /// The samples (three per pixel for RGB) in strip order; at least the image's bytes, perhaps more.
+        let raw: Data
+        /// True when `raw` holds big-endian samples (an uncompressed MM file; a decompressed page is little-endian).
+        let samplesBigEndian: Bool
+        let x: Axis?
+        let y: Axis?
+        let source: String
+        let notes: [String]
+    }
+
+    private static func decodePage(data: Data, fileName: String) throws -> Page {
         try checkFirstDirectory(data)
         let file: TIFFFile
         do { file = try TIFFFile(data: data, path: fileName) } catch TIFFError.notTIFF { throw Refusal.notTIFF } catch {
@@ -148,8 +271,9 @@ public nonisolated enum TIFFAppImage {
         if let why = TIFFCompression.predictorRefusal(predictor, format: format, bytes: bitsPerSample / 8) {
             throw Refusal.sampleFormat(why.replacingOccurrences(of: "it sets ", with: ""))
         }
-        // A compressed page decodes to little-endian samples (TIFFCompression.decodePage).
-        let decode = try decoder(bits: bitsPerSample, format: format, bigEndian: compression == 1 && file.bigEndian)
+        // A compressed page decodes to little-endian samples (TIFFCompression.decodePage). The decoder is made here so an
+        // unread sample type is refused at this point in the order, before the strips are checked.
+        _ = try decoder(bits: bitsPerSample, format: format, bigEndian: compression == 1 && file.bigEndian)
 
         // The strips, concatenated in order, must hold exactly the image.
         guard let offsets = tags.integers(byCode[273]), let counts = tags.integers(byCode[279]),
@@ -192,30 +316,14 @@ public nonisolated enum TIFFAppImage {
             }
         }
 
-        var pixels = [Float](repeating: 0, count: width * height)
-        try raw.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-            if isRGB {
-                for i in 0..<(width * height) {
-                    let base = i * 3 * bytesPerSample
-                    let r = decode(buffer, base), g = decode(buffer, base + bytesPerSample),
-                        b = decode(buffer, base + 2 * bytesPerSample)
-                    guard acceptUnequalChannels || r == g && g == b else {
-                        throw Refusal.unequalChannels(row: i / width, column: i % width)
-                    }
-                    pixels[i] = r
-                }
-            } else {
-                for i in 0..<(width * height) { pixels[i] = decode(buffer, i * bytesPerSample) }
-            }
-        }
-
         var notes: [String] = []
         if isRGB { notes.append(Note.render) }
         let (x, y, calibrationNotes, source) = calibration(tags, page)
         notes += calibrationNotes
         let kind = isRGB ? "RGB render" : "\(format == 3 ? "float" : format == 2 ? "int" : "uint")\(bitsPerSample)"
-        return Image(width: width, height: height, pixels: pixels, x: x, y: y, fileName: fileName,
-                     source: (["TIFF · \(kind)", source].compactMap { $0 } + notes).joined(separator: " · "), notes: notes)
+        return Page(width: width, height: height, bitsPerSample: bitsPerSample, bytesPerSample: bytesPerSample, format: format,
+                    isRGB: isRGB, raw: raw, samplesBigEndian: compression == 1 && file.bigEndian, x: x, y: y,
+                    source: (["TIFF · \(kind)", source].compactMap { $0 } + notes).joined(separator: " · "), notes: notes)
     }
 
     // MARK: - The header and the first directory

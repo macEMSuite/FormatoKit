@@ -157,6 +157,18 @@ public nonisolated struct DM4Image: Sendable, Equatable {
     public let yAxis: DM4Axis?
 }
 
+/// A decoded 2D image object at the file's stored element type (`DM4Experiment.readStoredImage`, FormatoKit#115).
+public nonisolated struct DM4StoredImage: Sendable, Equatable {
+    public let object: DM4ImageObject
+    public let width: Int
+    public let height: Int
+    /// Shape `[height, width]` (row-major, `width` fastest), the stored type: int8/16/32, uint8/16/32, float32, float64.
+    /// Converting each value to Float gives `DM4Image.pixels`.
+    public let pixels: FormatoArray
+    public let xAxis: DM4Axis?
+    public let yAxis: DM4Axis?
+}
+
 /// A decoded EDS spectrum image: counts in `(ny, nx, channels)` row-major (the layout `DenseSpectrumImage` takes),
 /// and the energy axis exactly as the file states it (units NOT converted: the caller reads `units`).
 public nonisolated struct DM4EDSSpectrumImage: Sendable, Equatable {
@@ -231,6 +243,15 @@ public nonisolated enum DM4Experiment {
         try readImage(source: try Source.file(path), index: index)
     }
 
+    /// `readImage(path:index:)` at the stored bit depth: that object's bytes, read once, no Float32 array on the way.
+    public static func readStoredImage(path: String, index: Int) throws -> DM4StoredImage {
+        try readStoredImage(source: try Source.file(path), index: index)
+    }
+
+    public static func readStoredImage(data: Data, index: Int) throws -> DM4StoredImage {
+        try readStoredImage(source: Source.data(data), index: index)
+    }
+
     public static func list(data: Data) throws -> [DM4ImageObject] {
         try Walk(source: Source.data(data)).objects
     }
@@ -287,10 +308,35 @@ public nonisolated enum DM4Experiment {
     }
 
     private static func readImage(source: Source, index: Int) throws -> DM4Image {
+        try decode2D(try imageObject(index, source: source), source: source)
+    }
+
+    private static func readStoredImage(source: Source, index: Int) throws -> DM4StoredImage {
+        let object = try imageObject(index, source: source)
+        let blob = try fetch2D(object, source: source)
+        let type: FormatoDataType
+        switch object.dataType {
+        case 1: type = .int16
+        case 10: type = .uint16
+        case 7: type = .int32
+        case 11: type = .uint32
+        case 6: type = .uint8
+        case 9: type = .int8
+        case 2: type = .float32
+        case 12: type = .float64
+        default: throw DM4Error.unsupportedDataType(object.dataType)
+        }
+        // DM stores little-endian, FormatoArray's order: the fetched bytes are the array.
+        return DM4StoredImage(object: object, width: blob.width, height: blob.height,
+                              pixels: try FormatoArray(dataType: type, shape: [blob.height, blob.width], bytes: Data(blob.raw)),
+                              xAxis: blob.xAxis, yAxis: blob.yAxis)
+    }
+
+    private static func imageObject(_ index: Int, source: Source) throws -> DM4ImageObject {
         guard let object = try Walk(source: source).objects.first(where: { $0.index == index }) else {
             throw DM4Error.cannotOpen("This DM file has no image object \(index).")
         }
-        return try decode2D(object, source: source)
+        return object
     }
 
     /// Decodes the EDS spectrum image `index` (one-based) of the file at `path`. Throws `DM4Error.cannotOpen` with the
@@ -417,6 +463,29 @@ public nonisolated enum DM4Experiment {
     private static let maxImageBytes = 1 << 30
 
     private static func decode2D(_ object: DM4ImageObject, source: Source) throws -> DM4Image {
+        let blob = try fetch2D(object, source: source)
+        let (raw, count) = (blob.raw, blob.width * blob.height)
+        var out = [Float](repeating: 0, count: count)
+        raw.withUnsafeBytes { p in
+            switch object.dataType {
+            case 1:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) }
+            case 10: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self)) }
+            case 7:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self)) }
+            case 11: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)) }
+            case 6:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: UInt8.self)) }
+            case 9:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: Int8.self)) }
+            case 2:  for i in 0..<count { out[i] = p.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
+            case 12: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 8, as: Double.self)) }
+            default: break
+            }
+        }
+        return DM4Image(object: object, width: blob.width, height: blob.height, pixels: out,
+                        xAxis: blob.xAxis, yAxis: blob.yAxis)
+    }
+
+    /// One 2D object's checks and its own bytes as stored, with its size and axes.
+    private static func fetch2D(_ object: DM4ImageObject, source: Source) throws
+        -> (raw: [UInt8], width: Int, height: Int, xAxis: DM4Axis?, yAxis: DM4Axis?) {
         let big = object.dimensions.filter { $0 > 1 }
         // Singleton dimensions are dropped, so a [w, h, 1] stack reads as 2D.
         guard big.count <= 2, object.dimensions.count >= 2 else {
@@ -441,25 +510,10 @@ public nonisolated enum DM4Experiment {
             throw DM4Error.cannotOpen("Image object \(object.index) is \(bytes) bytes; refusing to read a 2D image that large.")
         }
         let raw = try source.fetch(object.dataOffset, bytes)       // this object's own bytes only
-        var out = [Float](repeating: 0, count: count)
-        raw.withUnsafeBytes { p in
-            switch object.dataType {
-            case 1:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) }
-            case 10: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self)) }
-            case 7:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self)) }
-            case 11: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)) }
-            case 6:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: UInt8.self)) }
-            case 9:  for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i, as: Int8.self)) }
-            case 2:  for i in 0..<count { out[i] = p.loadUnaligned(fromByteOffset: i * 4, as: Float.self) }
-            case 12: for i in 0..<count { out[i] = Float(p.loadUnaligned(fromByteOffset: i * 8, as: Double.self)) }
-            default: break
-            }
-        }
         let axisIndices = nonSingleton.map(\.offset)
         let xAxis = axisIndices.first.flatMap { object.axes[$0] }
         let yAxis = axisIndices.count > 1 ? object.axes[axisIndices[1]] : nil
-        return DM4Image(object: object, width: width, height: height, pixels: out,
-                        xAxis: xAxis, yAxis: yAxis)
+        return (raw, width, height, xAxis, yAxis)
     }
 
     /// Most values one EDS spectrum image may hold: a quarter of physical memory as UInt32 (this Mac panicked once reading a

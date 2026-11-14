@@ -64,6 +64,24 @@ import FormatoCore
         #expect(throws: FormatoReadError.truncated(url.lastPathComponent)) { try short.readAll() }
     }
 
+    /// `floats()` (FormatoKit#115): each type widened as Float32 holds it; a float32 is its stored bits (a NaN payload kept),
+    /// integers and float64 rounded once. Red before: `floats()` did not exist.
+    @Test func testFloatsWidenEachStoredType() throws {
+        func array<T>(_ type: FormatoDataType, _ values: [T]) throws -> FormatoArray {
+            try FormatoArray(dataType: type, shape: [values.count], bytes: values.withUnsafeBytes { Data($0) })
+        }
+        #expect(try array(.uint8, [UInt8(0), 1, 255]).floats() == [0, 1, 255])
+        #expect(try array(.int8, [Int8(-128), -1, 127]).floats() == [-128, -1, 127])
+        #expect(try array(.uint16, [UInt16(0), 300, 65535]).floats() == [0, 300, 65535])
+        #expect(try array(.int16, [Int16(-32768), 0, 32767]).floats() == [-32768, 0, 32767])
+        #expect(try array(.uint32, [UInt32(16_777_217)]).floats() == [Float(16_777_217 as UInt32)])
+        #expect(try array(.int32, [Int32(-16_777_217)]).floats() == [Float(-16_777_217 as Int32)])
+        let nan = Float(bitPattern: 0x7FC0_1234)
+        #expect(try array(.float32, [Float(-0.0), 1e-40, nan]).floats().map(\.bitPattern) == [Float(-0.0), 1e-40, nan].map(\.bitPattern))
+        #expect(try array(.float64, [0.1, 1e300]).floats() == [Float(0.1 as Double), Float(1e300 as Double)])
+        #expect(try array(.rgb8, [UInt8(1), 2, 3, 4, 5, 6]).floats() == [1, 2, 3, 4, 5, 6])
+    }
+
     @Test func testByteCountAndShapeAreChecked() {
         #expect(throws: FormatoArrayError.byteCountMismatch(expected: 16, got: 15)) { try FormatoArray(dataType: .float32, shape: [2, 2], bytes: Data(count: 15)) }
         #expect(throws: FormatoArrayError.invalidShape([-1])) { try FormatoArray(dataType: .float32, shape: [-1], bytes: Data()) }
