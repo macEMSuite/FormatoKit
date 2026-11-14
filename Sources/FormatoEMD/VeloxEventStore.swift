@@ -188,16 +188,19 @@ package nonisolated enum VeloxStreamDecoder {
         }
         let first = frames.lowerBound, last = frames.upperBound
 
-        // Pass 1: events per pixel, over every stream.
-        var perPixel = [Int](repeating: 0, count: pixels + 1)
+        // One array of pixels + 1 offsets serves the count, the scatter and the reading of each pixel's events (a counting
+        // sort shifted by one): pass 1 counts pixel p's events at bucket[p + 1]; the prefix sum makes bucket[p] where p's
+        // events start; the scatter advances bucket[p] to where they end, which is where p + 1's start. Pixel p's events
+        // then lie in bucket[p - 1] ..< bucket[p] (from 0 for pixel 0).
+        var bucket = [Int](repeating: 0, count: pixels + 1)
         var outOfRange = 0
         var ends: [(frame: Int, navigation: Int, done: Bool)] = []
         let passesTotal = 2 * streams.count
         var passesDone = 0
-        try perPixel.withUnsafeMutableBufferPointer { counts in
+        try bucket.withUnsafeMutableBufferPointer { counts in
             for stream in streams {
                 var cursor = Cursor()
-                var visitor = CountingVisitor(perPixel: counts.baseAddress!, channels: geometry.channels)
+                var visitor = CountingVisitor(perPixel: counts.baseAddress! + 1, channels: geometry.channels)
                 try stream { block in
                     try FormatoCancellation.check(cancelled)
                     if cursor.done { return false }
@@ -211,17 +214,13 @@ package nonisolated enum VeloxStreamDecoder {
             }
         }
 
-        // Bucket offsets (exclusive prefix sum), then pass 2: scatter the channels.
-        var bucketStart = [Int](repeating: 0, count: pixels + 1)
-        var running = 0
-        for p in 0..<pixels { bucketStart[p] = running; running += perPixel[p] }
-        bucketStart[pixels] = running
-        let totalEvents = running
+        // Where each pixel's events start (the prefix sum in place), then pass 2: scatter the channels.
+        for p in stride(from: 1, through: pixels, by: 1) { bucket[p] += bucket[p - 1] }
+        let totalEvents = bucket[pixels]
 
         let events = UnsafeMutablePointer<UInt16>.allocate(capacity: max(totalEvents, 1))
         defer { events.deallocate() }
-        var fillCursor = Array(bucketStart[0..<pixels])
-        try fillCursor.withUnsafeMutableBufferPointer { cursorPerPixel in
+        try bucket.withUnsafeMutableBufferPointer { cursorPerPixel in
             for stream in streams {
                 var cursor = Cursor()
                 var visitor = FillVisitor(cursorPerPixel: cursorPerPixel.baseAddress!, events: events, channels: geometry.channels)
@@ -242,7 +241,8 @@ package nonisolated enum VeloxStreamDecoder {
         var distinct = 0
         for p in 0..<pixels {
             if p & 0xFFFF == 0 { try FormatoCancellation.check(cancelled) }   // every 65536 pixels, never per value
-            var segment = UnsafeMutableBufferPointer(start: events + bucketStart[p], count: perPixel[p])
+            let start = p == 0 ? 0 : bucket[p - 1]
+            var segment = UnsafeMutableBufferPointer(start: events + start, count: bucket[p] - start)
             segment.sort()
             var n = 0
             var previous: UInt16?
@@ -256,7 +256,8 @@ package nonisolated enum VeloxStreamDecoder {
             counts.withUnsafeMutableBufferPointer { countOut in
                 var w = 0
                 for p in 0..<pixels {
-                    let segment = UnsafeBufferPointer(start: events + bucketStart[p], count: perPixel[p])
+                    let start = p == 0 ? 0 : bucket[p - 1]
+                    let segment = UnsafeBufferPointer(start: events + start, count: bucket[p] - start)
                     var i = 0
                     while i < segment.count {
                         let channel = segment[i]
