@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/macEMSuite/FormatoKit/compare/0.15.1...0.16.0) (2026-11-14)
+
+
+### Features
+
+* the app image readers hand back pixels at the stored bit depth ([#121](https://github.com/macEMSuite/FormatoKit/issues/121)) ([1affd9d](https://github.com/macEMSuite/FormatoKit/commit/1affd9da4ba3bf71be2fa869e051e8bde70f3fa7))
+
 ## [0.15.1](https://github.com/macEMSuite/FormatoKit/compare/0.15.0...0.15.1) (2026-11-13)
 
 
