@@ -110,11 +110,20 @@ public nonisolated final class EMDDatacubeWriter: @unchecked Sendable {
     /// Writes the next `rows` scan rows: `values` holds `rows * shape[1] * shape[2] * shape[3]` float32 in C order. Rows go in
     /// order; a band past the end throws `invalidArgument` and a band whose values do not fit `rows` throws `FormatoArrayError`; neither writes anything.
     public func write(rows: Int, values: [Float]) throws {
+        try values.withUnsafeBufferPointer { try write(rows: rows, band: $0) }
+    }
+
+    /// `write(rows:values:)` from the caller's memory: HDF5 reads the band where it is, never from a copy. The array that
+    /// wraps it lives only for the synchronous write.
+    private func write(rows: Int, band values: UnsafeBufferPointer<Float>) throws {
         let band = [rows] + Array(layout.shape.dropFirst())
         guard rows >= 1, rows <= layout.shape[0] - nextRow else {
             throw HDF5FileError.invalidArgument("\(rows) rows after \(nextRow) leave a scan of \(layout.shape[0]) rows")
         }
-        let array = try FormatoArray(dataType: .float32, shape: band, bytes: values.withUnsafeBytes { Data($0) })
+        let bytes = UnsafeRawBufferPointer(values)
+        let wrapped = bytes.isEmpty ? Data()
+            : Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: bytes.baseAddress!), count: bytes.count, deallocator: .none)
+        let array = try FormatoArray(dataType: .float32, shape: band, bytes: wrapped)
         let start = nextRow
         try pending.append { try $0.writeSlab(dataPath, start: [start, 0, 0, 0], array) }
         nextRow += rows
@@ -144,14 +153,16 @@ public nonisolated final class EMDDatacubeWriter: @unchecked Sendable {
         let rowCount = layout.shape[1] * layout.shape[2] * layout.shape[3]
         let writer = try EMDDatacubeWriter(destination: destination, layout: layout, sourcePath: sourcePath)
         do {
-            // Bands of about 16 Mi values keep a large cube's memory flat.
+            // Bands of about 16 Mi values keep HDF5's own buffers flat; each band is written from `values` where it lies.
             let rowsPerBand = max(1, (16 << 20) / max(1, rowCount))
-            var row = 0
-            while row < layout.shape[0] {
-                try FormatoCancellation.check(cancelled)
-                let rows = min(rowsPerBand, layout.shape[0] - row)
-                try writer.write(rows: rows, values: Array(values[(row * rowCount)..<((row + rows) * rowCount)]))
-                row += rows
+            try values.withUnsafeBufferPointer { all in
+                var row = 0
+                while row < layout.shape[0] {
+                    try FormatoCancellation.check(cancelled)
+                    let rows = min(rowsPerBand, layout.shape[0] - row)
+                    try writer.write(rows: rows, band: UnsafeBufferPointer(rebasing: all[(row * rowCount)..<((row + rows) * rowCount)]))
+                    row += rows
+                }
             }
             try FormatoCancellation.check(cancelled)
             try writer.publish()
