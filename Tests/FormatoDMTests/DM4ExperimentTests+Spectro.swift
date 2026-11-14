@@ -567,7 +567,7 @@ import FormatoDM
         let u8: [UInt8] = [0, 1, 127, 128, 254, 255]
         let u16: [UInt16] = [0, 1, 255, 256, 65534, 65535]
         let i16: [Int16] = [-32768, -1, 0, 1, 300, 32767]
-        let f32: [Float] = [-0.5, 0, 1e-40, 3.25, .infinity, 1e30]
+        let f32: [Float] = [-0.5, 0, Float.leastNormalMagnitude / 4, 3.25, .infinity, 1e30]
         let data = Self.file(imageList: [
             Self.object(name: "U8", dataType: 6, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 10, blob: u8, count: 6, tags: []),
             Self.object(name: "U16", dataType: 10, dims: [3, 2], axes: [Self.nm, Self.umY], blobType: 4, blob: Self.u16s(u16), count: 6, tags: []),

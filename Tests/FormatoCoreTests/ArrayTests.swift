@@ -77,7 +77,7 @@ import FormatoCore
         #expect(try array(.uint32, [UInt32(16_777_217)]).floats() == [Float(16_777_217 as UInt32)])
         #expect(try array(.int32, [Int32(-16_777_217)]).floats() == [Float(-16_777_217 as Int32)])
         let nan = Float(bitPattern: 0x7FC0_1234)
-        #expect(try array(.float32, [Float(-0.0), 1e-40, nan]).floats().map(\.bitPattern) == [Float(-0.0), 1e-40, nan].map(\.bitPattern))
+        #expect(try array(.float32, [Float(-0.0), Float.leastNormalMagnitude / 4, nan]).floats().map(\.bitPattern) == [Float(-0.0), Float.leastNormalMagnitude / 4, nan].map(\.bitPattern))
         #expect(try array(.float64, [0.1, 1e300]).floats() == [Float(0.1 as Double), Float(1e300 as Double)])
         let rgb = try FormatoArray(dataType: .rgb8, shape: [2], bytes: Data([1, 2, 3, 4, 5, 6]))
         #expect(rgb.floats() == [1, 2, 3, 4, 5, 6])
