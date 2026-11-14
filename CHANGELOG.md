@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.1](https://github.com/macEMSuite/FormatoKit/compare/0.16.0...0.16.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* a 2D DM image is bounded by its Float32 size and read without a second full copy ([#124](https://github.com/macEMSuite/FormatoKit/issues/124)) ([47324ee](https://github.com/macEMSuite/FormatoKit/commit/47324eed15a582863a9dd4b38c6dc02d212f081f))
+* a TIFF's strips and tags never make the reader copy more than the file holds ([#123](https://github.com/macEMSuite/FormatoKit/issues/123)) ([8eaf7af](https://github.com/macEMSuite/FormatoKit/commit/8eaf7af9bfaf265ff2b44f8d23e35816be514907))
+* HDF5 reads stay within a byte limit and what the file can give ([#125](https://github.com/macEMSuite/FormatoKit/issues/125)) ([a37dcc2](https://github.com/macEMSuite/FormatoKit/commit/a37dcc2411813f5199e742a91b872d6520304838))
+* the PNG encoder, the EMD writer and the MSA reader drop their extra copies ([#127](https://github.com/macEMSuite/FormatoKit/issues/127)) ([b8ad25a](https://github.com/macEMSuite/FormatoKit/commit/b8ad25a39af4f4069565cd34ddd66a11f7482bd6))
+* Velox spectra and the event store hold one array where they held three or four ([#126](https://github.com/macEMSuite/FormatoKit/issues/126)) ([272041f](https://github.com/macEMSuite/FormatoKit/commit/272041f8e4e10e3c53f6e48244a905d525c059b4))
+
 ## [0.16.0](https://github.com/macEMSuite/FormatoKit/compare/0.15.1...0.16.0) (2026-11-14)
 
 
