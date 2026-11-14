@@ -291,7 +291,8 @@ private nonisolated final class CubeStorage: @unchecked Sendable {
                 throw HDF5DatacubeError.malformed("Dimension vector length: \(path)")
             }
             let n = info.shape[0]
-            let values = try read(path, shape: info.shape, type: info.type, start: [0], count: [min(n, 2)]).doubles()
+            let values = try read(path, shape: info.shape, type: info.type, start: [0], count: [min(n, 2)],
+                                  maximumBytes: HDF5Reader.defaultMaximumBytes).doubles()
             let scale: Double? = n > 1 ? values[1] - values[0] : nil
             if n > 2, let scale {
                 // A full coordinate vector must be uniform to be FormatoCore's uniform axis. py4DSTEM (emdfile
@@ -302,7 +303,7 @@ private nonisolated final class CubeStorage: @unchecked Sendable {
                 // Check in bounded blocks, without loading a potentially large vector all at once.
                 for first in stride(from: 0, to: n, by: 4096) {
                     let block = try read(path, shape: info.shape, type: info.type,
-                        start: [first], count: [min(4096, n - first)]).doubles()
+                        start: [first], count: [min(4096, n - first)], maximumBytes: HDF5Reader.defaultMaximumBytes).doubles()
                     guard block.enumerated().allSatisfy({ i, value in
                         HDF5Datacube.isUniform(value, expected: values[0] + Double(first + i) * scale, step: scale)
                     }) else {
