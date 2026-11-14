@@ -71,8 +71,21 @@ public nonisolated final class HDF5SlabReader: @unchecked Sendable {
 
     /// The slab `start`/`count` (both of the dataset's rank) as a `FormatoArray` of the stored type, as little-endian bytes.
     public func read(start: [Int], count: [Int]) throws -> FormatoArray {
+        try read(start: start, count: count, maximumBytes: HDF5Reader.defaultMaximumBytes)
+    }
+
+    /// `read(start:count:)` refusing a slab over `maximumBytes`, as `HDF5Reader.readDataset` does: the slab is checked
+    /// against the dataset and the limit before anything is allocated.
+    package func read(start: [Int], count: [Int], maximumBytes: Int) throws -> FormatoArray {
+        do { try FormatoArray.validateSlab(start: start, count: count, shape: shape) } catch {
+            throw HDF5FileError.invalidArgument("slab \(start) of \(count) is outside \(path) of shape \(shape)")
+        }
         let elements = try FormatoArray.elementCount(count)
-        var data = Data(count: elements * dataType.byteSize)
+        let (bytes, overflow) = elements.multipliedReportingOverflow(by: dataType.byteSize)
+        guard !overflow, bytes <= maximumBytes else {
+            throw HDF5FileError.limitExceeded("reading \(path) needs more than \(maximumBytes) bytes")
+        }
+        var data = Data(count: bytes)
         try data.withUnsafeMutableBytes { try read(start: start, count: count, into: $0) }
         return try FormatoArray(dataType: dataType, shape: count, bytes: data)
     }

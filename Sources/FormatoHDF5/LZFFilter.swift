@@ -66,6 +66,9 @@ package nonisolated enum LZF {
         return .decoded(o)
     }
 
+    /// Most bytes one input byte decodes to: a long back reference, three bytes, gives 7 + 255 + 2 = 264.
+    package static let maximumExpansion = 88
+
     /// The size `input` decodes to, or nil when it is not an LZF stream: the same walk as `decompress`, without writing.
     package static func decodedSize(_ input: UnsafeRawBufferPointer) -> Int? {
         guard let source = input.baseAddress?.assumingMemoryBound(to: UInt8.self), input.count > 0 else { return nil }
@@ -121,6 +124,12 @@ package nonisolated enum LZFFilter {
         guard flags & reverse != 0, let buffer, let bufferSize, let input = buffer.pointee, inputCount > 0 else { return 0 }
         let source = UnsafeRawBufferPointer(start: input, count: inputCount)
         var size = chunkBytes.flatMap { $0 > 0 ? $0 : nil } ?? bufferSize.pointee
+        // A claim larger than the input can give (LZF.maximumExpansion bytes per input byte) is measured, not allocated.
+        let (reach, overflow) = inputCount.multipliedReportingOverflow(by: LZF.maximumExpansion)
+        if !overflow, size > reach {
+            guard let measured = LZF.decodedSize(source) else { return 0 }
+            size = measured
+        }
         for attempt in 0 ..< 2 {
             guard size > 0, let output = malloc(size) else { return 0 }
             switch LZF.decompress(source, into: UnsafeMutableRawBufferPointer(start: output, count: size)) {

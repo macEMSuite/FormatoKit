@@ -83,8 +83,14 @@ public nonisolated struct HDF5Datacube: FormatoLazyArray {
 
     /// Read a rectangular hyperslab in stored order, preserving the numeric type and bits.
     public func read(start: [Int], count: [Int]) throws -> FormatoArray {
+        try read(start: start, count: count, maximumBytes: HDF5Reader.defaultMaximumBytes)
+    }
+
+    /// `read(start:count:)` refusing a slab over `maximumBytes` (`HDF5Reader.defaultMaximumBytes`, as `readDataset`) before
+    /// anything is allocated.
+    package func read(start: [Int], count: [Int], maximumBytes: Int) throws -> FormatoArray {
         try FormatoArray.validateSlab(start: start, count: count, shape: shape)
-        return try storage.read(datasetPath, shape: shape, type: dataType, start: start, count: count)
+        return try storage.read(datasetPath, shape: shape, type: dataType, start: start, count: count, maximumBytes: maximumBytes)
     }
 }
 
@@ -107,8 +113,17 @@ private nonisolated struct CubeArray: FormatoLazyArray {
     let dataType: FormatoDataType
     func read(start: [Int], count: [Int]) throws -> FormatoArray {
         try FormatoArray.validateSlab(start: start, count: count, shape: shape)
-        return try storage.read(path, shape: shape, type: dataType, start: start, count: count)
+        return try storage.read(path, shape: shape, type: dataType, start: start, count: count,
+                                maximumBytes: HDF5Reader.defaultMaximumBytes)
     }
+}
+
+/// The C string at `pointer` when it holds at most `maximumBytes` bytes before its NUL; nil when it is longer. Only
+/// `maximumBytes + 1` bytes are looked at, and the string is copied only once it is known to fit.
+package nonisolated func boundedCString(_ pointer: UnsafePointer<CChar>, maximumBytes: Int) -> String? {
+    let length = strnlen(pointer, maximumBytes + 1)
+    guard length <= maximumBytes else { return nil }
+    return String(decoding: UnsafeRawBufferPointer(start: pointer, count: length), as: UTF8.self)
 }
 
 private func checkedBytes(_ shape: [Int], _ type: FormatoDataType) throws -> Int {
@@ -185,10 +200,14 @@ private nonisolated final class CubeStorage: @unchecked Sendable {
         default: throw HDF5DatacubeError.unsupported(type.rawValue)
         }
     }
-    func read(_ path: String, shape: [Int], type: FormatoDataType, start: [Int], count: [Int]) throws -> FormatoArray {
+    func read(_ path: String, shape: [Int], type: FormatoDataType, start: [Int], count: [Int], maximumBytes: Int) throws
+        -> FormatoArray {
         try HDF5Serial.run {
             silence()
             let n = try checkedBytes(count, type)
+            guard n <= maximumBytes else {
+                throw HDF5DatacubeError.unsupported("a slab of \(n) bytes, over the \(maximumBytes)-byte limit")
+            }
             var bytes = Data(count: n)
             if n > 0 {
                 let ds = try dataset(path); defer { _ = h5.h5dclose(ds) }
@@ -241,7 +260,10 @@ private nonisolated final class CubeStorage: @unchecked Sendable {
                 let status = withUnsafeMutableBytes(of: &ptr) { read(type, $0.baseAddress) }
                 guard status >= 0, let ptr else { throw HDF5DatacubeError.readFailed(key) }
                 defer { _ = h5.h5freeMemory(ptr) }
-                return .text(String(cString: ptr))
+                guard let text = boundedCString(ptr, maximumBytes: HDF5Reader.defaultMaximumStringBytes) else {
+                    throw HDF5DatacubeError.malformed("String over \(HDF5Reader.defaultMaximumStringBytes) bytes: \(key)")
+                }
+                return .text(text)
             }
             let n = h5.h5tgetSize(type)
             guard n > 0, n < 65536 else { throw HDF5DatacubeError.malformed("Invalid string size") }
