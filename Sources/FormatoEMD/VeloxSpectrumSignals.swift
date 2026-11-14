@@ -150,21 +150,21 @@ private nonisolated struct VeloxSpectrumRead {
         guard !overflow, !overflow2, total <= policy.arrayByteLimit else {
             throw VeloxEMDError.readFailed("a spectrum dataset of \(bins) x \(stack) values is larger than the read limit")
         }
-        var stored = [UInt8](repeating: 0, count: total)
-        try stored.withUnsafeMutableBytes {
+        // One array the size of the dataset: a stack is read spectrum by spectrum (a column of the stored [bins, stack]) into
+        // its row of the [stack, bins] result, never read whole and transposed into a second copy.
+        var out = Data(count: total)
+        let rowBytes = bins * type.byteSize
+        try out.withUnsafeMutableBytes {
             guard let base = $0.baseAddress else { return }   // bins and stack are > 0 above; never nil
-            try file.readSlab(d, type: memory, start: d.dims.map { _ in 0 }, count: d.dims, into: base)
-        }
-        guard stack > 1 else { return (type, bins, stack, Data(stored)) }
-        let size = type.byteSize
-        var out = [UInt8](repeating: 0, count: total)
-        for s in 0..<stack {
-            for b in 0..<bins {
-                let from = (b * stack + s) * size, to = (s * bins + b) * size
-                for k in 0..<size { out[to + k] = stored[from + k] }
+            if stack == 1 {
+                try file.readSlab(d, type: memory, start: d.dims.map { _ in 0 }, count: d.dims, into: base)
+                return
+            }
+            for s in 0..<stack {
+                try file.readSlab(d, type: memory, start: [0, s], count: [bins, 1], into: base + s * rowBytes)
             }
         }
-        return (type, bins, stack, Data(out))
+        return (type, bins, stack, out)
     }
 
     /// `_get_dispersion_offset` with `rebin_energy` 1: the first `Detectors` entry, in written order, whose DetectorName contains
