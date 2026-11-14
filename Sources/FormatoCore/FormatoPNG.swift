@@ -102,11 +102,16 @@ public nonisolated enum FormatoPNG {
         var header = [UInt8]()
         header += be32(width); header += be32(height)
         header += [format.bitDepth, format.colorType, 0, 0, 0]               // compression, filter, no interlace
-        var out = Data(signature)
-        out.append(contentsOf: framed("IHDR", header))
+        // The pixels are held as the caller's, the filtered rows and the zlib stream; the stream is framed straight into the
+        // file, never copied into a chunk first.
+        let stream = zlib(raw)
+        raw = []
+        var out = Data(capacity: signature.count + 25 + chunks.reduce(0) { $0 + $1.count } + stream.count + 24)
+        out.append(contentsOf: signature)
+        appendChunk("IHDR", header, to: &out)
         for chunk in chunks { out.append(contentsOf: chunk) }
-        out.append(contentsOf: framed("IDAT", zlib(raw)))
-        out.append(contentsOf: framed("IEND", []))
+        appendChunk("IDAT", stream, to: &out)
+        appendChunk("IEND", [], to: &out)
         return out
     }
 
@@ -201,6 +206,16 @@ public nonisolated enum FormatoPNG {
         return be32(body.count) + typeAndBody + be32(Int(crc32(typeAndBody)))
     }
 
+    /// `framed(type, body)` appended to `out` without copying `body` into a chunk first.
+    private static func appendChunk(_ type: String, _ body: [UInt8], to out: inout Data) {
+        let typeBytes = Array(type.utf8)
+        out.append(contentsOf: be32(body.count))
+        out.append(contentsOf: typeBytes)
+        out.append(contentsOf: body)
+        let register = body.withUnsafeBufferPointer { crc32Register($0, start: crc32Register(typeBytes)) }
+        out.append(contentsOf: be32(Int(register ^ 0xFFFF_FFFF)))
+    }
+
     private static func be32(_ value: Int) -> [UInt8] {
         let v = UInt32(truncatingIfNeeded: value)
         return [UInt8(v >> 24), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)]
@@ -222,9 +237,15 @@ public nonisolated enum FormatoPNG {
 
     /// ISO 3309 / PNG CRC-32 (the one `zlib.crc32` computes).
     public static func crc32(_ bytes: some Sequence<UInt8>) -> UInt32 {
-        var c: UInt32 = 0xFFFF_FFFF
+        crc32Register(bytes) ^ 0xFFFF_FFFF
+    }
+
+    /// The CRC register after `bytes`, from `start` (the register before any byte): `crc32` is it with the final XOR, and a
+    /// CRC over two pieces is the second continued from the first's register, without joining them.
+    private static func crc32Register(_ bytes: some Sequence<UInt8>, start: UInt32 = 0xFFFF_FFFF) -> UInt32 {
+        var c = start
         for b in bytes { c = crcTable[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
-        return c ^ 0xFFFF_FFFF
+        return c
     }
 
     /// Adler-32 (the one `zlib.adler32` computes).
@@ -244,27 +265,40 @@ public nonisolated enum FormatoPNG {
 
     /// A zlib stream: header 0x78 0x9C, raw deflate (Compression framework), Adler-32. Data it will not shrink goes in stored blocks.
     package static func zlibCompress(_ raw: [UInt8]) -> [UInt8] {
-        var deflated = [UInt8]()
+        // One array: the header, the deflate stream written in place after it and cut to what was written, the checksum.
         if !raw.isEmpty {
             let capacity = raw.count + raw.count / 100 + 1024
-            var buffer = [UInt8](repeating: 0, count: capacity)
+            var out = [UInt8](repeating: 0, count: 2 + capacity + 4)
             let written = raw.withUnsafeBufferPointer { source in
-                buffer.withUnsafeMutableBufferPointer { target in
-                    compression_encode_buffer(target.baseAddress!, capacity, source.baseAddress!, raw.count, nil, COMPRESSION_ZLIB)
+                out.withUnsafeMutableBufferPointer { target in
+                    compression_encode_buffer(target.baseAddress! + 2, capacity, source.baseAddress!, raw.count, nil, COMPRESSION_ZLIB)
                 }
             }
-            if written > 0 { deflated = Array(buffer[0..<written]) }
+            if written > 0 {
+                out[0] = 0x78; out[1] = 0x9C
+                out.removeSubrange((2 + written)...)
+                out += be32(Int(adler32(raw)))
+                return out
+            }
         }
-        if deflated.isEmpty { deflated = storedBlocks(raw) }
-        return [0x78, 0x9C] + deflated + be32(Int(adler32(raw)))
+        var out: [UInt8] = [0x78, 0x9C]
+        storedBlocks(raw, into: &out)
+        out += be32(Int(adler32(raw)))
+        return out
     }
 
     /// A zlib stream of stored blocks only: what `zlibCompress` falls back to when the Compression framework gives nothing.
-    package static func zlibStored(_ raw: [UInt8]) -> [UInt8] { [0x78, 0x01] + storedBlocks(raw) + be32(Int(adler32(raw))) }
+    package static func zlibStored(_ raw: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = [0x78, 0x01]
+        storedBlocks(raw, into: &out)
+        out += be32(Int(adler32(raw)))
+        return out
+    }
 
-    /// Deflate stored blocks (no compression): 5 bytes of header per up-to-65535 bytes.
-    static func storedBlocks(_ raw: [UInt8]) -> [UInt8] {
-        var out = [UInt8](); out.reserveCapacity(raw.count + raw.count / 65535 * 5 + 5)
+    /// Deflate stored blocks (no compression), 5 bytes of header per up-to-65535 bytes, appended to `out` with room kept for
+    /// a trailing checksum.
+    static func storedBlocks(_ raw: [UInt8], into out: inout [UInt8]) {
+        out.reserveCapacity(out.count + raw.count + raw.count / 65535 * 5 + 5 + 4)
         var index = 0
         repeat {
             let count = min(65535, raw.count - index)
@@ -273,6 +307,5 @@ public nonisolated enum FormatoPNG {
             out += raw[index..<(index + count)]
             index += count
         } while index < raw.count
-        return out
     }
 }

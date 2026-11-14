@@ -190,29 +190,6 @@ public nonisolated enum MSAReader {
         let name = fileName.map(formatoDisplayFileName) ?? "(memory)"
         func raises(_ why: String) -> FormatoReadError { .unsupported("MSA file \(name): \(why) (RosettaSciIO raises).") }
 
-        var scalars: PyText
-        switch encoding {
-        case .latin1: scalars = bytes.map { Unicode.Scalar($0) }
-        case .utf8: scalars = Array(String(decoding: bytes, as: UTF8.self).unicodeScalars)
-        }
-        // Universal newlines, as Python's text-mode iteration; each line keeps its "\n".
-        var lines: [PyText] = []
-        var line: PyText = []
-        var i = 0
-        while i < scalars.count {
-            let s = scalars[i]
-            if s == "\r" {
-                if i + 1 < scalars.count, scalars[i + 1] == "\n" { i += 1 }
-                line.append("\n"); lines.append(line); line = []
-            } else if s == "\n" {
-                line.append("\n"); lines.append(line); line = []
-            } else {
-                line.append(s)
-            }
-            i += 1
-        }
-        if !line.isEmpty { lines.append(line) }
-
         var keys: [String] = []
         var values: [String: MSAValue?] = [:]
         func store(_ key: String, _ value: MSAValue?) {
@@ -221,76 +198,105 @@ public nonisolated enum MSAReader {
         }
         var y: [Double] = []
         var dataSection = false
-        for line in lines {
-            if !dataSection {
-                guard line[0] == "#" else { continue }
-                let parts = pySplit(line, pyText(": "))
-                var key: PyText
-                var value: PyText?
-                if parts.count == 2 {
-                    key = parts[0]
-                    value = pyRstrip(parts[1])
-                } else {
-                    key = line
-                    value = nil
-                }
-                let keyName = pyString(pyStrip(pyStripHash(key)))
-                if keyName == "TITLE" || keyName == "COMMENT", values[keyName] != nil {
-                    guard case .some(.text(let old)) = values[keyName], let value else { throw raises("a repeated \(keyName) line whose value is missing (TypeError)") }
-                    store(keyName, .text(old + pyString(value)))
-                } else if keyName != "SPECTRUM" {
-                    store(keyName, value.map { .text(pyString($0)) })
-                } else {
-                    dataSection = true
-                }
-            } else if line[0] != "#" {
-                // `line.replace(",", " ").strip().split()`: token ranges, converted one by one (a plain decimal through strtod,
-                // anything else through the Python float rules).
-                var tokens: [Range<Int>] = []
-                var startOfToken: Int?
-                for (k, scalar) in line.enumerated() {
-                    if scalar == "," || pyIsSpace(scalar) {
-                        if let st = startOfToken { tokens.append(st..<k); startOfToken = nil }
-                    } else if startOfToken == nil {
-                        startOfToken = k
+        // One reused token list and number buffer: a data line allocates nothing of its own.
+        var tokens: [Range<Int>] = []
+        var buffer = [CChar](repeating: 0, count: 64)
+
+        /// The text's lines, walked in place: universal newlines as Python's text-mode iteration (`\r`, `\n`, `\r\n` each
+        /// end a line, which keeps a "\n"). A header line becomes its own scalars; a data line is read where it lies.
+        func walk<Text: RandomAccessCollection>(_ text: Text) throws where Text.Element == Unicode.Scalar, Text.Index == Int {
+            var start = text.startIndex
+            let end = text.endIndex
+            while start < end {
+                var stop = start
+                while stop < end, text[stop] != "\n", text[stop] != "\r" { stop += 1 }
+                let hasBreak = stop < end
+                let next = !hasBreak ? end : (text[stop] == "\r" && stop + 1 < end && text[stop + 1] == "\n") ? stop + 2 : stop + 1
+                defer { start = next }
+                let first: Unicode.Scalar = stop > start ? text[start] : "\n"
+                if !dataSection {
+                    guard first == "#" else { continue }
+                    let line: PyText = Array(text[start..<stop]) + (hasBreak ? ["\n"] : [])
+                    let parts = pySplit(line, pyText(": "))
+                    var key: PyText
+                    var value: PyText?
+                    if parts.count == 2 {
+                        key = parts[0]
+                        value = pyRstrip(parts[1])
+                    } else {
+                        key = line
+                        value = nil
                     }
-                }
-                if let st = startOfToken { tokens.append(st..<line.count) }
-                if pyStrip(line).isEmpty { continue }   // `line.strip()` empty; a line of only separators still has no columns
-                guard values["DATATYPE"] != nil else { throw raises("a data line before a DATATYPE keyword (KeyError)") }
-                let datatype: String
-                if case .some(.some(.text(let t))) = values["DATATYPE"] { datatype = t } else { continue }   // DATATYPE None: neither XY nor Y, nothing read
-                func number(_ index: Int) throws -> Double {
-                    guard index < tokens.count else { throw raises("a data line with too few columns (IndexError)") }
-                    let token = tokens[index]
-                    var plain = true
-                    var buffer = [CChar](repeating: 0, count: token.count + 1)
-                    for (k, scalar) in line[token].enumerated() {
-                        switch scalar {
-                        case "0"..."9", "+", "-", ".", "e", "E": buffer[k] = CChar(scalar.value)
-                        default: plain = false
+                    let keyName = pyString(pyStrip(pyStripHash(key)))
+                    if keyName == "TITLE" || keyName == "COMMENT", values[keyName] != nil {
+                        guard case .some(.text(let old)) = values[keyName], let value else { throw raises("a repeated \(keyName) line whose value is missing (TypeError)") }
+                        store(keyName, .text(old + pyString(value)))
+                    } else if keyName != "SPECTRUM" {
+                        store(keyName, value.map { .text(pyString($0)) })
+                    } else {
+                        dataSection = true
+                    }
+                } else if first != "#" {
+                    // `line.replace(",", " ").strip().split()`: token ranges, converted one by one (a plain decimal through strtod,
+                    // anything else through the Python float rules). The line's "\n" is a space, so it ends no token here.
+                    tokens.removeAll(keepingCapacity: true)
+                    var startOfToken: Int?
+                    for k in start..<stop {
+                        let scalar = text[k]
+                        if scalar == "," || pyIsSpace(scalar) {
+                            if let st = startOfToken { tokens.append(st..<k); startOfToken = nil }
+                        } else if startOfToken == nil {
+                            startOfToken = k
                         }
-                        if !plain { break }
                     }
-                    if plain {
-                        var end: UnsafeMutablePointer<CChar>?
-                        let v = buffer.withUnsafeMutableBufferPointer { p -> Double in
-                            let r = strtod(p.baseAddress!, &end)
-                            return end == p.baseAddress! + token.count ? r : .nan
+                    if let st = startOfToken { tokens.append(st..<stop) }
+                    // `line.strip()` empty; a line of only separators still has no columns
+                    if !text[start..<stop].contains(where: { !pyIsSpace($0) }) { continue }
+                    guard values["DATATYPE"] != nil else { throw raises("a data line before a DATATYPE keyword (KeyError)") }
+                    let datatype: String
+                    if case .some(.some(.text(let t))) = values["DATATYPE"] { datatype = t } else { continue }   // DATATYPE None: neither XY nor Y, nothing read
+                    func number(_ index: Int) throws -> Double {
+                        guard index < tokens.count else { throw raises("a data line with too few columns (IndexError)") }
+                        let token = tokens[index]
+                        if buffer.count < token.count + 1 { buffer = [CChar](repeating: 0, count: 2 * token.count + 1) }
+                        var plain = true
+                        for (k, scalar) in text[token].enumerated() {
+                            switch scalar {
+                            case "0"..."9", "+", "-", ".", "e", "E": buffer[k] = CChar(scalar.value)
+                            default: plain = false
+                            }
+                            if !plain { break }
                         }
-                        // strtod reads a leading "e" or a bare "." as nothing (end short): those fall to the Python rules below.
-                        if !(v.isNaN) { return v }
+                        if plain {
+                            buffer[token.count] = 0
+                            var end: UnsafeMutablePointer<CChar>?
+                            let v = buffer.withUnsafeMutableBufferPointer { p -> Double in
+                                let r = strtod(p.baseAddress!, &end)
+                                return end == p.baseAddress! + token.count ? r : .nan
+                            }
+                            // strtod reads a leading "e" or a bare "." as nothing (end short): those fall to the Python rules below.
+                            if !(v.isNaN) { return v }
+                        }
+                        let written = pyString(Array(text[token]))
+                        guard let v = formatoPythonFloat(written) else { throw raises("the data value '\(written)' is not a float (ValueError)") }
+                        return v
                     }
-                    guard let v = formatoPythonFloat(pyString(Array(line[token]))) else { throw raises("the data value '\(pyString(Array(line[token])))' is not a float (ValueError)") }
-                    return v
-                }
-                if datatype == "XY" {
-                    y.append(try number(1))
-                    if tokens.count > 2 { y.append(try number(3)) }
-                } else if datatype == "Y" {
-                    for index in tokens.indices { y.append(try number(index)) }
+                    if datatype == "XY" {
+                        y.append(try number(1))
+                        if tokens.count > 2 { y.append(try number(3)) }
+                    } else if datatype == "Y" {
+                        for index in tokens.indices { y.append(try number(index)) }
+                    }
                 }
             }
+        }
+        // Latin-1 is read byte by byte as scalars (one byte held per input byte); UTF-8 is decoded once.
+        switch encoding {
+        case .latin1:
+            let raw = [UInt8](bytes)
+            try walk(raw.lazy.map { Unicode.Scalar($0) })
+        case .utf8:
+            try walk(Array(String(decoding: bytes, as: UTF8.self).unicodeScalars))
         }
         store("FORMAT", .text(msaFormatText))
 

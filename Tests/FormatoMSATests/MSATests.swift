@@ -159,3 +159,17 @@ private let creator = "RosettaSciIO version 0.14.1.dev96+g049e7d707"
     #expect(lines.first == "#FORMAT      : EMSA/MAS Spectral Data File" && lines.last == "#ENDOFDATA   : End Of Data and File")
     #expect(lines.contains("7.000000, "))
 }
+
+/// The lines are walked in place (macEMSuite/FormatoKit#109): `\r`, `\n` and `\r\n` each end a line, a last line without a
+/// break is read, empty lines and lines of separators carry no values, and Latin-1 and UTF-8 read the same file alike.
+@Test func linesWalkedInPlaceKeepPythonsNewlines() throws {
+    let text = "#FORMAT      : EMSA/MAS Spectral Data File\r#VERSION     : 1.0\n#TITLE       : Mixed\r\n#XPERCHAN    : 10\r"
+        + "#OFFSET      : -5\n#XUNITS      : eV\r\n#DATATYPE    : Y\n#SPECTRUM    : Spectral Data Starts Here\r\n"
+        + "1, 2\r\r , ,\n3.5e1,,-4\r\n\n+6 7 1e400\r#ENDOFDATA   : End\n12"
+    for encoding in [MSAEncoding.latin1, .utf8] {
+        let s = try MSAReader.parse(bytes: Data(text.utf8), fileName: "/tmp/mixed.msa", encoding: encoding).signal
+        #expect(s.title == "Mixed")
+        #expect(s.data.doubles() == [1, 2, 35, -4, 6, 7, .infinity, 12], "\(encoding)")
+        #expect(s.axes.first?.size == 8 && s.axes.first?.scale == 10 && s.axes.first?.offset == -5)
+    }
+}
